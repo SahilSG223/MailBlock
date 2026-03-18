@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 300px;
+      font-family: 'Google Sans', sans-serif;
+      background: #fff;
+      color: #202124;
+    }
+    .header {
+      background: #1a73e8;
+      color: white;
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .header h1 { font-size: 16px; font-weight: 500; }
+    .body { padding: 16px; }
+    .status-card {
+      background: #f8f9fa;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+      font-size: 13px;
+      color: #5f6368;
+    }
+    .status-card .label { font-weight: 500; color: #202124; margin-bottom: 4px; }
+    button {
+      width: 100%;
+      padding: 10px;
+      background: #1a73e8;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    button:hover { background: #1557b0; }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+    .server-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #5f6368;
+      margin-top: 10px;
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #ccc;
+    }
+    .dot.online { background: #34a853; }
+    .dot.offline { background: #ea4335; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span>✉️</span>
+    <h1>MailBlock</h1>
+  </div>
+  <div class="body">
+    <div class="status-card">
+      <div class="label">Last run</div>
+      <div id="last-run">Never</div>
+    </div>
+    <div class="status-card">
+      <div class="label">Emails processed</div>
+      <div id="processed">0</div>
+    </div>
+    <div class="status-card">
+      <div class="label">Status</div>
+      <div id="status-text">Idle</div>
+    </div>
+    <button id="run-btn">Classify inbox now</button>
+    <div class="server-status">
+      <div class="dot" id="server-dot"></div>
+      <span id="server-label">Checking local server...</span>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
