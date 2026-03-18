@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+transformers
+accelerate>=1.1.0
+torch
+datasets
+scikit-learn
+pandas
+python-dotenv
+cryptography
