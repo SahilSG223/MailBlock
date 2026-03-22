@@ -1,9 +1,53 @@
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 const LOCAL_API = "http://127.0.0.1:8000";
+const REQUEST_TIMEOUT_MS = 10000;
+const RUN_TIMEOUT_MS = 120000;
 
 function setStatus(update) {
   chrome.storage.local.set(update);
 }
+
+function getRunState() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(
+      ["status", "lastRun", "processed", "total", "error", "runStartedAt"],
+      resolve
+    );
+  });
+}
+
+async function normalizeStatus() {
+  const state = await getRunState();
+  const startedAt = state.runStartedAt ? Date.parse(state.runStartedAt) : NaN;
+  const isStaleRun =
+    state.status === "running" &&
+    (!startedAt || Number.isNaN(startedAt) || Date.now() - startedAt > RUN_TIMEOUT_MS);
+
+  if (isStaleRun) {
+    const normalized = {
+      status: "idle",
+      error: "",
+      processed: 0,
+      total: 0,
+      runStartedAt: "",
+    };
+    setStatus(normalized);
+    return { ...state, ...normalized };
+  }
+
+  return state;
+}
+
+normalizeStatus().catch((err) => {
+  console.error("MailBlock status normalization error:", err);
+  setStatus({
+    status: "idle",
+    error: "",
+    processed: 0,
+    total: 0,
+    runStartedAt: "",
+  });
+});
 
 async function logStep(message, extra = {}) {
   console.log("MailBlock:", message, extra);
@@ -40,41 +84,39 @@ async function getToken() {
 }
 
 async function fetchJson(url, options = {}) {
-  const res = await fetch(url, options);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data.error?.message || `Request failed: ${res.status}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error?.message || `Request failed: ${res.status}`);
+    }
+    return data;
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  return data;
 }
 
-// Fetch all inbox emails with pagination
+// Fetch only the most recent inbox email
 async function fetchEmails(token) {
-  await logStep("Fetching inbox messages from Gmail");
-  const messages = [];
-  let pageToken = "";
+  await logStep("Fetching the most recent inbox message from Gmail");
+  const params = new URLSearchParams({
+    maxResults: "1",
+    q: "in:inbox"
+  });
 
-  while (true) {
-    const params = new URLSearchParams({
-      maxResults: "100",
-      q: "in:inbox"
-    });
-    if (pageToken) {
-      params.set("pageToken", pageToken);
-    }
+  const data = await fetchJson(`${GMAIL_API}/messages?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
 
-    const data = await fetchJson(`${GMAIL_API}/messages?${params.toString()}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-
-    messages.push(...(data.messages || []));
-    await logStep(`Fetched ${messages.length} inbox messages so far`);
-    if (!data.nextPageToken) {
-      break;
-    }
-    pageToken = data.nextPageToken;
-  }
-
+  const messages = data.messages || [];
+  await logStep(`Fetched ${messages.length} inbox message`);
   return messages;
 }
 
@@ -95,8 +137,19 @@ async function classifyEmail(subject, sender, body = "") {
   });
 }
 
+async function loadLabelCache(token) {
+  const data = await fetchJson(`${GMAIL_API}/labels`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  const cache = {};
+  for (const label of data.labels || []) {
+    cache[label.name] = label.id;
+  }
+  return cache;
+}
+
 // Get or create a Gmail label
-async function getOrCreateLabel(token, name) {
+async function getOrCreateLabel(token, name, labelCache) {
   await logStep(`Ensuring label exists for ${name}`);
   const colors = {
     Spam: { backgroundColor: "#cc3a21", textColor: "#ffffff" },
@@ -107,12 +160,10 @@ async function getOrCreateLabel(token, name) {
     Promotions: { backgroundColor: "#e07000", textColor: "#ffffff" },
   };
 
-  // Check existing labels
-  const data = await fetchJson(`${GMAIL_API}/labels`, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  const existing = data.labels?.find(l => l.name === `MailBlock/${name}`);
-  if (existing) return existing.id;
+  const fullName = `MailBlock/${name}`;
+  if (labelCache[fullName]) {
+    return labelCache[fullName];
+  }
 
   // Create new label
   const label = await fetchJson(`${GMAIL_API}/labels`, {
@@ -122,12 +173,13 @@ async function getOrCreateLabel(token, name) {
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      name: `MailBlock/${name}`,
+      name: fullName,
       labelListVisibility: "labelShow",
       messageListVisibility: "show",
       color: colors[name] || { backgroundColor: "#999999", textColor: "#ffffff" }
     })
   });
+  labelCache[fullName] = label.id;
   return label.id;
 }
 
@@ -145,13 +197,14 @@ async function applyLabel(token, messageId, labelId) {
 }
 
 // Main function — classify all unread emails
-async function processInbox() {
+async function processInboxInternal() {
   try {
     setStatus({
       status: "running",
       error: "",
       processed: 0,
       total: 0,
+      runStartedAt: new Date().toISOString(),
       lastStep: "Starting mailbox classification",
       logs: []
     });
@@ -159,6 +212,8 @@ async function processInbox() {
     const token = await getToken();
     await logStep("Gmail authorization succeeded");
     const messages = await fetchEmails(token);
+    const labelCache = await loadLabelCache(token);
+    await logStep("Loaded Gmail label cache");
 
     let processed = 0;
     const total = messages.length;
@@ -178,7 +233,7 @@ async function processInbox() {
       });
       const result = await classifyEmail(subject, sender);
       await logStep(`Model predicted ${result.category} for message ${msg.id}`);
-      const labelId = await getOrCreateLabel(token, result.category);
+      const labelId = await getOrCreateLabel(token, result.category, labelCache);
       await applyLabel(token, msg.id, labelId);
       processed++;
       setStatus({ processed, total, status: "running" });
@@ -189,17 +244,36 @@ async function processInbox() {
       status: "done",
       lastRun: new Date().toISOString(),
       processed,
-      total
+      total,
+      runStartedAt: ""
     });
     await logStep("Mailbox classification completed");
   } catch (err) {
     console.error("MailBlock error:", err);
     setStatus({
       status: "error",
-      error: err?.message || "Unknown error"
+      error: err?.message || "Unknown error",
+      runStartedAt: ""
     });
     await logStep(`Error: ${err?.message || "Unknown error"}`);
   }
+}
+
+async function processInbox() {
+  await Promise.race([
+    processInboxInternal(),
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("Mailbox classification timed out")), RUN_TIMEOUT_MS);
+    }),
+  ]).catch(async (err) => {
+    console.error("MailBlock run timeout/error:", err);
+    setStatus({
+      status: "error",
+      error: err?.message || "Unknown error",
+      runStartedAt: ""
+    });
+    await logStep(`Error: ${err?.message || "Unknown error"}`);
+  });
 }
 
 // Listen for messages from popup
@@ -216,10 +290,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.action === "getStatus") {
-    chrome.storage.local.get(
-      ["status", "lastRun", "processed", "total", "error", "lastStep", "logs", "currentSubject", "currentSender"],
-      sendResponse
-    );
+    normalizeStatus().then(() => {
+      chrome.storage.local.get(
+        ["status", "lastRun", "processed", "total", "error"],
+        sendResponse
+      );
+    });
     return true;
   }
 });
